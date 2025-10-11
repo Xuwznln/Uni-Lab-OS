@@ -1,0 +1,477 @@
+name: Build Conda-Pack Environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: '选择要构建的分支'
+        required: true
+        default: 'dev'
+        type: string
+      platforms:
+        description: '选择构建平台 (逗号分隔): linux-64, osx-64, osx-arm64, win-64'
+        required: false
+        default: 'win-64'
+        type: string
+
+jobs:
+  build-conda-pack:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-64
+            env_file: unilabos-linux-64.yaml
+            script_ext: sh
+          - os: macos-13 # Intel
+            platform: osx-64
+            env_file: unilabos-osx-64.yaml
+            script_ext: sh
+          - os: macos-latest # ARM64
+            platform: osx-arm64
+            env_file: unilabos-osx-arm64.yaml
+            script_ext: sh
+          - os: windows-latest
+            platform: win-64
+            env_file: unilabos-win64.yaml
+            script_ext: bat
+
+    runs-on: ${{ matrix.os }}
+
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - name: Check if platform should be built
+        id: should_build
+        run: |
+          if [[ -z "${{ github.event.inputs.platforms }}" ]]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.inputs.platforms }}" == *"${{ matrix.platform }}"* ]]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.should_build.outputs.should_build == 'true'
+        with:
+          ref: ${{ github.event.inputs.branch }}
+          fetch-depth: 0
+
+      - name: Setup Miniconda
+        if: steps.should_build.outputs.should_build == 'true'
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniconda-version: 'latest'
+          channels: conda-forge,robostack-staging,uni-lab,defaults
+          channel-priority: strict
+          activate-environment: base
+          auto-activate-base: true
+          auto-update-conda: false
+          show-channel-urls: true
+
+      - name: Install mamba and conda-pack
+        if: steps.should_build.outputs.should_build == 'true'
+        run: |
+          conda install -n base -c conda-forge mamba conda-pack -y
+
+      - name: Create unilab environment
+        if: steps.should_build.outputs.should_build == 'true'
+        run: |
+          echo "Creating unilab environment..."
+          mamba create -n unilab uni-lab::unilabos -c uni-lab -c robostack-staging -c conda-forge -y
+
+      - name: Get latest ros-humble-unilabos-msgs version
+        if: steps.should_build.outputs.should_build == 'true'
+        id: msgs_version
+        run: |
+          conda activate unilab
+          INSTALLED_VERSION=$(conda list ros-humble-unilabos-msgs | grep ros-humble-unilabos-msgs | awk '{print $2}')
+          echo "installed_version=$INSTALLED_VERSION" >> $GITHUB_OUTPUT
+          echo "Installed ros-humble-unilabos-msgs version: $INSTALLED_VERSION"
+
+      - name: Check for newer ros-humble-unilabos-msgs
+        if: steps.should_build.outputs.should_build == 'true'
+        run: |
+          conda activate unilab
+          echo "Checking for available ros-humble-unilabos-msgs versions..."
+          mamba search ros-humble-unilabos-msgs -c uni-lab -c robostack-staging -c conda-forge --info || echo "Search completed"
+
+          echo "Updating ros-humble-unilabos-msgs to latest version..."
+          mamba update ros-humble-unilabos-msgs -c uni-lab -c robostack-staging -c conda-forge -y || echo "Already at latest version"
+
+      - name: Install latest unilabos from source
+        if: steps.should_build.outputs.should_build == 'true'
+        run: |
+          # Activate using conda run to ensure proper environment
+          conda run -n unilab pip uninstall unilabos -y || echo "unilabos not installed via pip"
+
+          echo "Installing unilabos from source (branch: ${{ github.event.inputs.branch }})..."
+          conda run -n unilab pip install -e .
+
+          echo "Verifying installation..."
+          conda run -n unilab pip show unilabos
+
+      - name: Display environment info
+        if: steps.should_build.outputs.should_build == 'true'
+        run: |
+          echo "=== Environment Information ==="
+          conda env list
+          echo ""
+          echo "=== Installed Packages ==="
+          conda list -n unilab | grep -E "(unilabos|ros-humble-unilabos-msgs)" || conda list -n unilab
+          echo ""
+          echo "=== Python Packages ==="
+          conda run -n unilab pip list | grep unilabos || conda run -n unilab pip list
+
+      - name: Verify environment integrity
+        if: steps.should_build.outputs.should_build == 'true'
+        run: |
+          echo "Verifying environment can be activated..."
+          conda run -n unilab python -c "import sys; print(f'Python version: {sys.version}')"
+
+          echo "Verifying unilabos import..."
+          conda run -n unilab python -c "import unilabos; print(f'UniLabOS version: {unilabos.__version__}')" || echo "Warning: Could not import unilabos"
+
+          echo "Checking critical packages..."
+          conda run -n unilab python -c "import rclpy; print('ROS2 rclpy: OK')"
+
+          echo "Running comprehensive verification script..."
+          conda run -n unilab python scripts/verify_installation.py || echo "Warning: Verification script reported issues"
+
+          echo "Environment verification complete!"
+
+      - name: Create installation script (Windows)
+        if: steps.should_build.outputs.should_build == 'true' && matrix.platform == 'win-64'
+        run: |
+          cat > install_unilab.bat << 'EOFSCRIPT'
+          @echo off
+          setlocal enabledelayedexpansion
+
+          echo ================================================
+          echo UniLabOS Environment Installation Script
+          echo ================================================
+          echo.
+
+          REM Get the directory where this script is located
+          set "SCRIPT_DIR=%~dp0"
+          cd /d "%SCRIPT_DIR%"
+
+          REM Find conda installation
+          echo Searching for conda installation...
+          set "CONDA_BASE="
+
+          REM Check common locations
+          if exist "%USERPROFILE%\miniforge3\Scripts\conda.exe" (
+              set "CONDA_BASE=%USERPROFILE%\miniforge3"
+          ) else if exist "%USERPROFILE%\miniconda3\Scripts\conda.exe" (
+              set "CONDA_BASE=%USERPROFILE%\miniconda3"
+          ) else if exist "%USERPROFILE%\anaconda3\Scripts\conda.exe" (
+              set "CONDA_BASE=%USERPROFILE%\anaconda3"
+          ) else if exist "C:\ProgramData\miniforge3\Scripts\conda.exe" (
+              set "CONDA_BASE=C:\ProgramData\miniforge3"
+          ) else if exist "C:\ProgramData\miniconda3\Scripts\conda.exe" (
+              set "CONDA_BASE=C:\ProgramData\miniconda3"
+          ) else if exist "C:\ProgramData\anaconda3\Scripts\conda.exe" (
+              set "CONDA_BASE=C:\ProgramData\anaconda3"
+          )
+
+          if "%CONDA_BASE%"=="" (
+              echo ERROR: Could not find conda installation!
+              echo Please make sure conda/mamba is installed.
+              pause
+              exit /b 1
+          )
+
+          echo Found conda at: %CONDA_BASE%
+          echo.
+
+          REM Set target environment path
+          set "ENV_NAME=unilab"
+          set "ENV_PATH=%CONDA_BASE%\envs\%ENV_NAME%"
+
+          REM Check if environment already exists
+          if exist "%ENV_PATH%" (
+              echo WARNING: Environment '%ENV_NAME%' already exists at %ENV_PATH%
+              echo.
+              set /p "OVERWRITE=Do you want to overwrite it? (y/n): "
+              if /i not "!OVERWRITE!"=="y" (
+                  echo Installation cancelled.
+                  pause
+                  exit /b 0
+              )
+              echo Removing existing environment...
+              rmdir /s /q "%ENV_PATH%"
+          )
+
+          REM Extract the packed environment
+          echo.
+          echo Extracting environment to %ENV_PATH%...
+          if not exist "unilab-env.tar.gz" (
+              echo ERROR: unilab-env.tar.gz not found!
+              pause
+              exit /b 1
+          )
+
+          REM Create target directory
+          mkdir "%ENV_PATH%"
+
+          REM Extract using tar (available in Windows 10+)
+          tar -xzf unilab-env.tar.gz -C "%ENV_PATH%"
+          if errorlevel 1 (
+              echo ERROR: Failed to extract environment!
+              pause
+              exit /b 1
+          )
+
+          echo.
+          echo Unpacking conda environment...
+          cd /d "%ENV_PATH%"
+
+          REM Run conda-unpack
+          if exist "Scripts\conda-unpack.exe" (
+              .\Scripts\conda-unpack.exe
+          ) else if exist "Scripts\activate.bat" (
+              call .\Scripts\activate.bat
+              conda-unpack
+          ) else (
+              echo ERROR: Could not find conda-unpack!
+              pause
+              exit /b 1
+          )
+
+          if errorlevel 1 (
+              echo ERROR: conda-unpack failed!
+              pause
+              exit /b 1
+          )
+
+          echo.
+          echo ================================================
+          echo Installation completed successfully!
+          echo ================================================
+          echo.
+          echo To activate the environment, run:
+          echo   conda activate %ENV_NAME%
+          echo.
+          echo or
+          echo.
+          echo   call %ENV_PATH%\Scripts\activate.bat
+          echo.
+          pause
+          EOFSCRIPT
+
+      - name: Create installation script (Unix)
+        if: steps.should_build.outputs.should_build == 'true' && matrix.platform != 'win-64'
+        run: |
+          cat > install_unilab.sh << 'EOFSCRIPT'
+          #!/bin/bash
+          set -e
+
+          echo "================================================"
+          echo "UniLabOS Environment Installation Script"
+          echo "================================================"
+          echo ""
+
+          # Get the directory where this script is located
+          SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+          cd "$SCRIPT_DIR"
+
+          # Find conda installation
+          echo "Searching for conda installation..."
+          CONDA_BASE=""
+
+          # Check if conda is in PATH
+          if command -v conda &> /dev/null; then
+              CONDA_BASE=$(conda info --base)
+          elif [ -d "$HOME/miniforge3" ]; then
+              CONDA_BASE="$HOME/miniforge3"
+          elif [ -d "$HOME/miniconda3" ]; then
+              CONDA_BASE="$HOME/miniconda3"
+          elif [ -d "$HOME/anaconda3" ]; then
+              CONDA_BASE="$HOME/anaconda3"
+          elif [ -d "/opt/conda" ]; then
+              CONDA_BASE="/opt/conda"
+          fi
+
+          if [ -z "$CONDA_BASE" ]; then
+              echo "ERROR: Could not find conda installation!"
+              echo "Please make sure conda/mamba is installed."
+              exit 1
+          fi
+
+          echo "Found conda at: $CONDA_BASE"
+          echo ""
+
+          # Initialize conda for this shell
+          source "$CONDA_BASE/etc/profile.d/conda.sh"
+
+          # Set target environment path
+          ENV_NAME="unilab"
+          ENV_PATH="$CONDA_BASE/envs/$ENV_NAME"
+
+          # Check if environment already exists
+          if [ -d "$ENV_PATH" ]; then
+              echo "WARNING: Environment '$ENV_NAME' already exists at $ENV_PATH"
+              read -p "Do you want to overwrite it? (y/n): " OVERWRITE
+              if [ "$OVERWRITE" != "y" ] && [ "$OVERWRITE" != "Y" ]; then
+                  echo "Installation cancelled."
+                  exit 0
+              fi
+              echo "Removing existing environment..."
+              rm -rf "$ENV_PATH"
+          fi
+
+          # Extract the packed environment
+          echo ""
+          echo "Extracting environment to $ENV_PATH..."
+          if [ ! -f "unilab-env.tar.gz" ]; then
+              echo "ERROR: unilab-env.tar.gz not found!"
+              exit 1
+          fi
+
+          mkdir -p "$ENV_PATH"
+          tar -xzf unilab-env.tar.gz -C "$ENV_PATH"
+
+          echo ""
+          echo "Unpacking conda environment..."
+          cd "$ENV_PATH"
+
+          # Run conda-unpack
+          if [ -f "bin/conda-unpack" ]; then
+              ./bin/conda-unpack
+          else
+              source bin/activate
+              conda-unpack
+          fi
+
+          echo ""
+          echo "================================================"
+          echo "Installation completed successfully!"
+          echo "================================================"
+          echo ""
+          echo "To activate the environment, run:"
+          echo "  conda activate $ENV_NAME"
+          echo ""
+          echo "or"
+          echo ""
+          echo "  source $ENV_PATH/bin/activate"
+          echo ""
+          EOFSCRIPT
+
+          chmod +x install_unilab.sh
+
+      - name: Pack the conda environment
+        if: steps.should_build.outputs.should_build == 'true'
+        run: |
+          echo "Packing conda environment..."
+          conda pack -n unilab -o unilab-env.tar.gz --ignore-missing-files
+
+          echo "Pack file created:"
+          ls -lh unilab-env.tar.gz
+
+      - name: Create final distribution package
+        if: steps.should_build.outputs.should_build == 'true'
+        run: |
+          echo "Creating distribution package..."
+          mkdir -p dist-package
+
+          # Copy packed environment
+          cp unilab-env.tar.gz dist-package/
+
+          # Copy installation script
+          if [ "${{ matrix.platform }}" == "win-64" ]; then
+            cp install_unilab.bat dist-package/
+          else
+            cp install_unilab.sh dist-package/
+          fi
+
+          # Copy verification script
+          cp scripts/verify_installation.py dist-package/
+
+          # Create README
+          cat > dist-package/README.txt << 'EOFREADME'
+          UniLabOS Conda-Pack Distribution
+          =================================
+
+          This package contains a pre-built UniLabOS environment that can be installed without internet access.
+
+          Installation Instructions:
+          --------------------------
+
+          Windows:
+            Double-click install_unilab.bat or run it from command prompt.
+
+          macOS/Linux:
+            Open terminal in this directory and run:
+              bash install_unilab.sh
+
+          The script will:
+          1. Find your conda installation
+          2. Extract the environment to the 'unilab' environment
+          3. Run conda-unpack to finalize the installation
+
+          After installation, activate the environment with:
+            conda activate unilab
+
+          Contents:
+          ---------
+          - unilab-env.tar.gz: Packed conda environment
+          - install_unilab.bat/sh: Installation script
+          - verify_installation.py: Verification script
+          - README.txt: This file
+
+          Verification:
+          ------------
+          After installation, you can verify it by running:
+            conda activate unilab
+            python verify_installation.py
+
+          Branch: ${{ github.event.inputs.branch }}
+          Platform: ${{ matrix.platform }}
+          Build Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          EOFREADME
+
+          echo "Distribution package contents:"
+          ls -lh dist-package/
+
+      - name: Compress distribution package
+        if: steps.should_build.outputs.should_build == 'true'
+        run: |
+          if [ "${{ matrix.platform }}" == "win-64" ]; then
+            # For Windows, use PowerShell to create a zip file
+            powershell -Command "Compress-Archive -Path dist-package\* -DestinationPath unilab-pack-${{ matrix.platform }}.zip -Force"
+          else
+            # For Unix systems, create a tar.gz
+            tar -czf unilab-pack-${{ matrix.platform }}.tar.gz -C dist-package .
+          fi
+
+          echo "Final package created:"
+          ls -lh unilab-pack-*
+
+      - name: Upload distribution package
+        if: steps.should_build.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unilab-pack-${{ matrix.platform }}-${{ github.event.inputs.branch }}
+          path: unilab-pack-*
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Display package info
+        if: steps.should_build.outputs.should_build == 'true'
+        run: |
+          echo "=========================================="
+          echo "Build Summary"
+          echo "=========================================="
+          echo "Platform: ${{ matrix.platform }}"
+          echo "Branch: ${{ github.event.inputs.branch }}"
+          echo "Package size:"
+          ls -lh unilab-pack-* || echo "Package file not found"
+          echo ""
+          echo "This package can be used for offline installation."
+          echo "Download the artifact and run the installation script."
+          echo "=========================================="
