@@ -32,7 +32,12 @@ from rclpy.service import Service
 from unilabos_msgs.action import StrSingleInput
 from unilabos.client.host.runtime.node import DeviceNode
 from unilabos.client.host.runtime.action import bind_action_context
-from unilabos.client.host.runtime.resource_slot import is_unset_resource_slot, resource_slot_shapes
+from unilabos.client.host.runtime.resource_slot import (
+    first_plr_resource,
+    is_unset_resource_slot,
+    reject_device_slot,
+    resource_slot_shapes,
+)
 from unilabos.client.host.runtime.async_utils import schedule_async_func
 from unilabos.registry.decorators import get_topic_config
 from unilabos.registry.action_policy import (
@@ -1568,7 +1573,7 @@ class BaseROS2DeviceNode(Node, DeviceNode, Generic[T]):
                         self.lab_logger().error(
                             f"转换ResourceSlot参数 {arg_name} 失败: {e}\n{traceback.format_exc()}"
                         )
-                        raise JsonCommandInitError(f"ResourceSlot参数转换失败: {arg_name}")
+                        raise JsonCommandInitError(f"ResourceSlot参数转换失败: {arg_name}：{e}")
 
                 # 处理 ResourceSlot 列表：逐元素剥离
                 elif slot_shape == "list":
@@ -1582,7 +1587,7 @@ class BaseROS2DeviceNode(Node, DeviceNode, Generic[T]):
                             self.lab_logger().error(
                                 f"转换ResourceSlot列表参数 {arg_name} 失败: {e}\n{traceback.format_exc()}"
                             )
-                            raise JsonCommandInitError(f"ResourceSlot列表参数转换失败: {arg_name}")
+                            raise JsonCommandInitError(f"ResourceSlot列表参数转换失败: {arg_name}：{e}")
             # ROS 2 执行没有框架上下文：可空的 ActionContext 参数得到 None，不可空的现建一个
             return function(**bind_action_context(function, function_args, None))
         except KeyError as ex:
@@ -1607,6 +1612,8 @@ class BaseROS2DeviceNode(Node, DeviceNode, Generic[T]):
         tree_set = self._require_resource_service().get_resources_sync(uuids_list, with_children=True)
         if not len(tree_set.trees):
             raise Exception(f"资源查询返回空树: {uuids_list}")
+        # ResourceSlot 只指物料：查到设备时明确报错（to_plr_resources 跳过设备树，下面会错位）
+        reject_device_slot(tree_set)
         plr_resources = tree_set.to_plr_resources()
 
         # 通过资源跟踪器获取本地实例
@@ -1645,7 +1652,7 @@ class BaseROS2DeviceNode(Node, DeviceNode, Generic[T]):
         if len(tree_set.trees) != 1:
             names = [t.root_node.res_content.name for t in tree_set.trees]
             raise ValueError(f"单物料输入要求恰好一个根物料，实际得到 {len(tree_set.trees)} 个根：{names}")
-        plr = tree_set.to_plr_resources()[0]
+        plr = first_plr_resource(tree_set, tree_set.trees[0].root_node.res_content.uuid)
         res = self.resource_tracker.figure_resource(plr, try_mode=True)
         if len(res) == 1:
             return res[0]
@@ -1747,7 +1754,7 @@ class BaseROS2DeviceNode(Node, DeviceNode, Generic[T]):
                         self.lab_logger().error(
                             f"转换ResourceSlot参数 {arg_name} 失败: {e}\n{traceback.format_exc()}"
                         )
-                        raise JsonCommandInitError(f"ResourceSlot参数转换失败: {arg_name}")
+                        raise JsonCommandInitError(f"ResourceSlot参数转换失败: {arg_name}：{e}")
 
                 # 处理 ResourceSlot 列表：逐元素剥离
                 elif slot_shape == "list":
@@ -1761,7 +1768,7 @@ class BaseROS2DeviceNode(Node, DeviceNode, Generic[T]):
                             self.lab_logger().error(
                                 f"转换ResourceSlot列表参数 {arg_name} 失败: {e}\n{traceback.format_exc()}"
                             )
-                            raise JsonCommandInitError(f"ResourceSlot列表参数转换失败: {arg_name}")
+                            raise JsonCommandInitError(f"ResourceSlot列表参数转换失败: {arg_name}：{e}")
 
             # ROS 2 执行没有框架上下文：可空的 ActionContext 参数得到 None，不可空的现建一个
             return await function(**bind_action_context(function, function_args, None))
@@ -1779,6 +1786,7 @@ class BaseROS2DeviceNode(Node, DeviceNode, Generic[T]):
 
         if unilabos_uuid:
             resource_tree = await self.get_resource([unilabos_uuid], with_children=True)
+            reject_device_slot(resource_tree)
             plr_resources = resource_tree.to_plr_resources()
             if plr_resources:
                 plr_resource = plr_resources[0]

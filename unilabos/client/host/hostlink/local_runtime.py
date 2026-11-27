@@ -24,7 +24,7 @@ from typing import (
 from unilabos.client.host.runtime.action import ActionContext, bind_action_context
 from unilabos.client.host.runtime.test_mode import build_test_mode_return, driver_runs_in_test_mode
 from unilabos.config.config import BasicConfig
-from unilabos.client.host.runtime.exception import TimeoutException
+from unilabos.client.host.runtime.exception import DeviceStartupError, TimeoutException
 from unilabos.client.host.runtime.driver_creator import (
     is_workstation_driver,
     pylabrobot_setup_finished,
@@ -33,7 +33,10 @@ from unilabos.client.host.runtime.driver_creator import (
 )
 from unilabos.client.host.runtime.node import BackendCapabilityError, DeviceNode
 from unilabos.client.host.runtime.resource import ResourceService
-from unilabos.client.host.runtime.resource_slot import is_unset_resource_slot
+from unilabos.client.host.runtime.resource_slot import (
+    first_plr_resource,
+    is_unset_resource_slot,
+)
 from unilabos.client.host.runtime.resource_slot import resource_slot_shape as _resource_slot_shape
 from unilabos.client.host.hostlink.service import (
     DeviceService,
@@ -865,8 +868,11 @@ class HostLinkDeviceNode(DeviceNode):
             mapped[target_name] = value
         return mapped
 
-    def _resolve_resource_slot(self, value: Any) -> Any:
-        """Resolve one ResourceSlot from this device's authoritative snapshot."""
+    def _resolve_resource_slot(self, value: Any, parameter: str = "") -> Any:
+        """Resolve one ResourceSlot from this device's authoritative snapshot.
+
+        ResourceSlot 只指物料：解析到设备时报错并指出参数（设备参数用 ``DeviceSlot``）。
+        """
 
         kind, payload = parse_resource_slot(value)
 
@@ -880,7 +886,9 @@ class HostLinkDeviceNode(DeviceNode):
                     "单个 ResourceSlot 必须恰好包含一棵资源树，"
                     f"实际为 {len(tree_set.trees)} 棵"
                 )
-            resource = tree_set.to_plr_resources()[0]
+            resource = first_plr_resource(
+                tree_set, tree_set.trees[0].root_node.res_content.uuid, parameter
+            )
             matches = self.resource_tracker.figure_resource(resource, try_mode=True)
             if len(matches) > 1:
                 raise ValueError(f"ResourceSlot 匹配到多个本地资源：{matches}")
@@ -895,7 +903,8 @@ class HostLinkDeviceNode(DeviceNode):
             identity = payload.get("uuid") or payload.get("id") or payload.get("name")
             tree_set = self._fetch_reference_from_authority(payload)
             if tree_set is not None and len(tree_set.trees):
-                resource = tree_set.to_plr_resources()[0]
+                # 设备节点不在本地 PLR 快照里：权威取回设备树时明确报错，不越界
+                resource = first_plr_resource(tree_set, identity, parameter)
                 refigured = self.resource_tracker.figure_resource(resource, try_mode=True)
                 if len(refigured) == 1:
                     return refigured[0]
@@ -956,13 +965,13 @@ class HostLinkDeviceNode(DeviceNode):
                 if is_unset_resource_slot(value):
                     resolved[name] = None
                 else:
-                    resolved[name] = self._resolve_resource_slot(value)
+                    resolved[name] = self._resolve_resource_slot(value, name)
             elif shape == "list":
                 values = resolved[name]
                 if not isinstance(values, list):
                     raise TypeError(f"ResourceSlot 列表参数 {name!r} 必须是列表")
                 resolved[name] = [
-                    self._resolve_resource_slot(value) for value in values
+                    self._resolve_resource_slot(value, name) for value in values
                 ]
 
         if PARAM_SAMPLE_UUIDS in signature.parameters:
@@ -1254,14 +1263,18 @@ class HostLinkDriverSpec:
 class HostLinkLocalRuntime:
     """管理一个 HostLink backend 进程内的全部本地驱动实例。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, isolate_device_failures: bool = False) -> None:
         self.backend_name = "hostlink"
+        #: Host 进程里为 True：一台设备装配 / 构造 / 初始化失败只让它进入维护模式，Host 与其余设备照常。
+        #: Slave 进程保持 False：失败即退出，交给受管进程的重启策略（``--root_devices_as_slaves``）。
+        self.isolate_device_failures = bool(isolate_device_failures)
         self.devices: dict[str, HostLinkDeviceNode] = {}
         #: 图中声明的 host_node 身份（device_id -> 资源 uuid），供内置 host
         #: 服务设备注册时复用，保证图导出与权威身份一致。
         self.graph_host_resource_uuids: dict[str, str] = {}
-        #: 设备图中没有启动的设备（device_id -> 原因记录）：backend 不支持而跳过的，以及持有的物料
-        #: 建不成 PLR 实例而进入维护模式的（记录带 ``maintenance`` / ``material_uuid`` / ``material_type``）；
+        #: 设备图中没有启动的设备（device_id -> 原因记录）：backend 不支持而跳过的，持有的物料
+        #: 建不成 PLR 实例而进入维护模式的（记录带 ``maintenance`` / ``material_uuid`` / ``material_type``），
+        #: 以及装配 / 构造 / 初始化失败而进入维护模式的（记录带 ``maintenance`` / ``stage`` / ``error_type``）；
         #: 由能力快照、``/api/v1/hostlink/peers`` 与 ``/api/v1/health`` 上报。
         self.unavailable_devices: dict[str, dict[str, Any]] = {}
         self.topic_bus = LocalTopicBus()
@@ -1630,20 +1643,84 @@ class HostLinkLocalRuntime:
             return await operation
         return await asyncio.wait_for(operation, float(timeout))
 
+    def mark_unavailable(
+        self,
+        device_id: str,
+        *,
+        registry_name: str,
+        reason: str,
+        supported_backends: Optional[list[str]] = None,
+        parent_device_id: str = "",
+        extra: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """登记一台没有启动的设备（backend 不支持、维护模式、父设备不可用）并写 ERROR 日志。"""
+
+        record: dict[str, Any] = {
+            "device_id": device_id,
+            "registry_name": registry_name,
+            "backend": self.backend_name,
+            "reason": reason,
+            **(extra or {}),
+        }
+        if supported_backends is not None:
+            record["supported_backends"] = list(supported_backends)
+        if parent_device_id:
+            record["parent_device_id"] = parent_device_id
+        self.unavailable_devices[device_id] = record
+        logging.getLogger(__name__).error(
+            "[HostLink] 设备 %s（%s）不可用，未启动：%s；其余设备照常启动",
+            device_id,
+            registry_name or "-",
+            reason,
+        )
+
+    def _enter_maintenance(self, node: HostLinkDeviceNode, error: Exception) -> None:
+        """启动失败的设备进入维护模式：移出运行时（连同已启动的子设备），登记不可用原因。"""
+
+        failure = DeviceStartupError(stage="initialize", error=error, device_id=node.device_id)
+        descendants: list[HostLinkDeviceNode] = []
+        pending = list(node.sub_devices.values())
+        while pending:
+            child = pending.pop(0)
+            descendants.append(child)
+            pending.extend(child.sub_devices.values())
+        self.remove_device(node.device_id)
+        record = failure.unavailable_record()
+        self.mark_unavailable(
+            node.device_id,
+            registry_name=node.registry_name,
+            reason=record.pop("reason"),
+            parent_device_id=node.parent_device_id,
+            extra=record,
+        )
+        for child in descendants:
+            self.mark_unavailable(
+                child.device_id,
+                registry_name=child.registry_name,
+                reason=f"父设备 {child.parent_device_id!r} 在 backend hostlink 上不可用，子设备一并停止",
+                parent_device_id=child.parent_device_id,
+            )
+
     def start(self) -> None:
         self._stopped.clear()
         started: list[HostLinkDeviceNode] = []
-        try:
-            # 设备图按父节点优先加入；反向启动可保证 Workstation post_init
-            # 运行前，其 sub-device 的 action/service/status 已全部就绪。
-            for node in reversed(tuple(self.devices.values())):
+        # 设备图按父节点优先加入；反向启动可保证 Workstation post_init
+        # 运行前，其 sub-device 的 action/service/status 已全部就绪。
+        for node in reversed(tuple(self.devices.values())):
+            if self.devices.get(node.device_id) is not node:
+                continue
+            try:
                 node.start()
                 started.append(node)
-            self._started = True
-        except Exception:
-            for node in reversed(started):
-                node.stop()
-            raise
+            except Exception as exc:
+                if not self.isolate_device_failures:
+                    for running in reversed(started):
+                        running.stop()
+                    raise
+                # Host 进程：一台设备初始化失败只让它进入维护模式
+                logging.getLogger(__name__).exception("HostLink 设备初始化失败：%s", node.device_id)
+                self._enter_maintenance(node, exc)
+        self._started = True
 
     def call_action(
         self,

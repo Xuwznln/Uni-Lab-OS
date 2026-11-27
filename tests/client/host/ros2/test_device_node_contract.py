@@ -248,3 +248,64 @@ def test_ros2_node_registers_both_subscribe_decorator_forms() -> None:
         "/devices/source/absolute",
         "/devices/source/split",
     }
+
+
+def test_ros2_resource_slot_pointing_at_a_device_is_rejected() -> None:
+    """与 HostLink 同一规则：ResourceSlot 只指物料，指向设备时明确报错（设备参数用 DeviceSlot）。"""
+
+    import logging
+
+    import pytest
+
+    from unilabos.client.host.runtime.resource_slot import DeviceResourceSlotError
+    from unilabos.resources.resource_tracker import (
+        DeviceNodeResourceTracker,
+        ResourceTreeInstance,
+        ResourceTreeSet,
+    )
+    from unilabos.server.services.materials.graph import graph_resource_tree
+    from tests.plr_fixtures import plate
+
+    robot_uuid = "6f0d1f3e-0c7a-4a55-9b7e-1d2c3b4a5f64"
+    plate_nodes = ResourceTreeSet.from_plr_resources([plate("loose_plate")], known_random_uuid=True).dump()[0]
+    graph = graph_resource_tree([
+        {"id": "robot", "uuid": robot_uuid, "type": "device", "class": "test_device",
+         "template_name": "test_device", "parent": None, "config": {}},
+        *plate_nodes,
+    ])
+    nodes = {node.res_content.uuid: node for node in graph.all_nodes}
+
+    class Service:
+        def get_resources_sync(self, uuids, with_children=True):
+            return ResourceTreeSet([ResourceTreeInstance(nodes[uuid]) for uuid in uuids])
+
+    class Node:
+        _convert_resources_sync = BaseROS2DeviceNode._convert_resources_sync
+        _assemble_single_resource = BaseROS2DeviceNode._assemble_single_resource
+        _convert_resource_async = BaseROS2DeviceNode._convert_resource_async
+        _resolve_slot_value_sync = BaseROS2DeviceNode._resolve_slot_value_sync
+        resource_tracker = DeviceNodeResourceTracker()
+
+        def _require_resource_service(self):
+            return Service()
+
+        async def get_resource(self, uuids, with_children=True):
+            return Service().get_resources_sync(uuids, with_children)
+
+        def lab_logger(self):
+            return logging.getLogger(__name__)
+
+    node = Node()
+    robot_tree = next(tree for tree in graph.dump() if tree[0]["uuid"] == robot_uuid)
+    for resolve in (
+        lambda: node._resolve_slot_value_sync({"uuid": robot_uuid}),
+        lambda: asyncio.run(node._convert_resource_async({"uuid": robot_uuid})),
+        lambda: node._assemble_single_resource(ResourceTreeSet.load([robot_tree])),
+        lambda: node._convert_resources_sync(robot_uuid, plate_nodes[0]["uuid"]),
+    ):
+        with pytest.raises(DeviceResourceSlotError, match="DeviceSlot") as caught:
+            resolve()
+        assert "robot" in str(caught.value) and robot_uuid in str(caught.value)
+    # 物料照常装配
+    (loose,) = node._convert_resources_sync(plate_nodes[0]["uuid"])
+    assert loose.name == "loose_plate"

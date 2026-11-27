@@ -79,7 +79,8 @@ def build_run_preflight_report(
             raise ValueError("运行模式无效")
         if expected_revision is not None and expected_revision != graph["workflow"]["revision"]:
             raise ValueError("工作流修订已变化，请刷新后重新预检")
-        resolved = resolve_task_input(declared_input_contract(graph["workflow"]), input_value)
+        input_contract = declared_input_contract(graph["workflow"])
+        resolved = resolve_task_input(input_contract, input_value)
         plan, _jobs = service._build_execution_plan(
             graph, run_mode=run_mode, target_node_uuid=target_node_uuid, entry_input=resolved,
         )
@@ -107,12 +108,20 @@ def build_run_preflight_report(
         check("inventory", "passed", "inventory_bindings_applied", "库存绑定已对应到计划中的库存需求",
               details={"bindings": bindings})
     # 按库位绑定的物料参数（{"site_uuid"}）：与建任务同一条解析路径，换成此刻占着库位的物料
-    from .material_sites import MaterialSiteError, bind_material_sites, read_site_facts, site_references
+    from .material_sites import (
+        MaterialSiteError,
+        bind_material_sites,
+        check_input_material_templates,
+        input_template_allowlists,
+        read_site_facts,
+        site_references,
+    )
 
     references = site_references([resolved, *(node.get("param") or {} for node in plan["nodes"])])
     if references:
         try:
-            site_bindings = bind_material_sites(plan, dict(resolved), read_site_facts(materials, references))
+            site_bindings = bind_material_sites(plan, dict(resolved), read_site_facts(materials, references),
+                                                input_contract=input_contract)
         except MaterialSiteError as error:
             node = next((item for item in plan["nodes"] if item["uuid"] == error.details.get("node_uuid")), None)
             check("resources", "blocked", "invalid_material_site", error.message, node=node, details=error.details)
@@ -122,6 +131,17 @@ def build_run_preflight_report(
             return finalize(report)
         check("resources", "passed", "material_sites_bound", "按库位绑定的物料参数已解析为库位上的物料",
               details={"bindings": site_bindings})
+    # 直接给 {"uuid"} 的工作流物料输入：按 @workflow(allowed_templates=...) 核对模板（按库位绑定的已在上面核对）
+    allowlists = input_template_allowlists(input_contract)
+    if allowlists and materials is not None:
+        try:
+            check_input_material_templates(resolved, allowlists, lambda identity: material_template_facts(materials, identity))
+        except MaterialSiteError as error:
+            check("resources", "blocked", "invalid_material_template", error.message, details=error.details)
+            return finalize(report)
+        except (RuntimeError, OSError) as error:
+            check("resources", "blocked", "material_template_unavailable", f"无法读取工作流物料输入的模板：{error}")
+            return finalize(report)
     # 按所属物料选择的库位参数（{"owner_uuid"}）：任务准入时才选定并预留，这里只读候选
     from .site_selections import SiteSelectionError, check_owner_sites, owner_site_requests, read_owner_facts
 
@@ -209,7 +229,7 @@ def build_run_preflight_report(
         if schema and "x-unilabos-action-contract" in schema:
             try:
                 values = validate_action_values(schema, node["param"], deferred=pending, managed_resources=True)
-                validate_resource_values(schema, values, materials, deferred=pending)
+                validate_resource_values(schema, values, materials, deferred=pending, device_id=device or None)
                 check("action_contract", "passed", "action_contract_ready", "静态动作参数符合合同", node=node)
             except ResourceUnavailableError as error:
                 check("resources", "blocked", "resource_unavailable", str(error), node=node)
@@ -240,6 +260,14 @@ def build_run_preflight_report(
     return finalize(report)
 
 
+def material_template_facts(materials: Any, identity: str) -> dict[str, Any]:
+    """物料的模板事实（``template_uuid`` / ``template_name``），供工作流物料输入的模板核对。"""
+
+    material = materials.get_material(identity).material
+    template_uuid = str(material.template_uuid or "")
+    return {"template_uuid": template_uuid, "template_name": getattr(material, "template_name", None) or template_uuid}
+
+
 def finalize(report: dict[str, Any]) -> dict[str, Any]:
     checks = report["checks"]
     for status in ("passed", "blocked", "deferred", "confirmation_required"):
@@ -255,9 +283,14 @@ def finalize(report: dict[str, Any]) -> dict[str, Any]:
 
 def validate_resource_values(
     schema: Mapping[str, Any], values: Mapping[str, Any], materials: Any,
-    *, deferred: Sequence[str] = (),
+    *, deferred: Sequence[str] = (), device_id: str | None = None,
 ) -> None:
-    """校验已知物料身份及库位参数（Material.site 声明的库位关系）的归属／占用；预检与派发共用。"""
+    """校验已知物料身份、设备参数及库位参数（MaterialRole.site_picker 声明的库位关系）的归属／占用；预检与派发共用。
+
+    ``device_id`` 是执行设备：``site_picker`` 省略 ``of`` 时库位属于它的根节点（不给时跳过这条核对）。
+    """
+    from unilabos.registry.action_resource_contract import EXECUTING_DEVICE
+    from unilabos.server.scheduler.tenancy_contract import slot_parameters
     fields = schema.get("properties", {}).get("goal", {}).get("properties", {})
 
     def material(identity: str | None, name: str) -> Any:
@@ -287,21 +320,34 @@ def validate_resource_values(
     device_parameters.update(item["param"] for item in contract.get("resource_params", []) if item["role"] in {"device","motion"})
     tenancy = contract.get("device_tenancy") or {}
     device_parameters.update(tenancy[field] for field in ("acquire_device_param","release_device_param") if tenancy.get(field))
-    for name in device_parameters:
-        if name in deferred or name not in values or not isinstance(values[name], str):
-            continue
+    device_parameters.discard(EXECUTING_DEVICE)
+    # 按类型：DeviceSlot 参数（含列表）都要指向已登记设备（派发时按它加设备锁）；没有物料权威时（如 Host 本地）不核对
+    if materials is not None:
+        device_parameters.update(slot_parameters(schema, "device"))
+
+    def device_aggregate(name: str, value: str) -> Any:
         if materials is None:
             raise ResourceUnavailableError("物料权威尚未接入，无法校验设备 ID")
         try:
-            aggregate = materials.get_material_by_resource_id(values[name])
+            aggregate = materials.get_material_by_resource_id(value)
         except (RuntimeError, OSError) as error:
             if getattr(error,"code",None) == "not_found":
-                raise ValueError(f"设备参数 {name} 指向不存在的设备 {values[name]}") from None
+                raise ValueError(f"设备参数 {name} 指向不存在的设备 {value}") from None
             raise ResourceUnavailableError(f"无法读取设备参数 {name}：{error}") from error
-        if aggregate.material.resource_type != "device" or aggregate.material.resource_id != values[name]:
+        if aggregate.material.resource_type != "device" or aggregate.material.resource_id != value:
             raise ValueError(f"设备参数 {name} 不是有效的设备 ID")
-        if aggregate.material.lifecycle_status in {"quarantined","consumed","disposed","deleted","retired"}:
-            raise ResourceUnavailableError(f"设备参数 {name} 当前不可用")
+        return aggregate
+
+    for name in device_parameters:
+        if name in deferred or name not in values:
+            continue
+        raw = values[name]
+        for value in ([raw] if isinstance(raw, str) else raw if isinstance(raw, list) else []):
+            if not isinstance(value, str) or not value.strip():
+                continue
+            aggregate = device_aggregate(name, value)
+            if aggregate.material.lifecycle_status in {"quarantined","consumed","disposed","deleted","retired"}:
+                raise ResourceUnavailableError(f"设备参数 {name} 当前不可用")
     for name, field in fields.items():
         if name in deferred or name not in values:
             continue
@@ -328,10 +374,24 @@ def validate_resource_values(
         if selector and values[name] is not None:
             if selector["owner"] in deferred or selector.get("occupant") in deferred:
                 continue
-            owner = (values.get(selector["owner"]) or {}).get("uuid")
+            owner_value = values.get(selector["owner"]) if selector.get("owner") else device_id
+            if isinstance(owner_value, str):
+                # 所属方是设备（DeviceSlot 参数，或省略 of 时的执行设备）：库位属于设备根节点
+                if not owner_value.strip():
+                    continue
+                owner = device_aggregate(selector.get("owner") or name, owner_value).material.material_uuid
+            else:
+                owner = (owner_value or {}).get("uuid")
+            if not owner:
+                continue
             occupant = values.get(selector.get("occupant"), {}) or {}
             aggregate = material(owner, name)
-            site = next((site for site in aggregate.sites if site.site_uuid == values[name]), None)
+            # 库位 uuid；或所属方下唯一的库位名 / 序号（工作流里写死的工位，派发前解析成库位 uuid）
+            matches = [site for site in aggregate.sites if site.site_uuid == values[name]] or [
+                site for site in aggregate.sites
+                if isinstance(values[name], str)
+                and values[name] in (getattr(site, "label", None), str(getattr(site, "site_index", None)))]
+            site = matches[0] if len(matches) == 1 else None
             if site is None:
                 raise ValueError(f"库位参数 {name} 不属于所选容器或已失效")
             if not selector["allow_occupied"] and site.occupied_material_uuid not in {None, occupant.get("uuid")}:

@@ -17,7 +17,7 @@ from unilabos.client.host.hostlink.local_runtime import (
 from unilabos.client.host.runtime import BackendCapabilityError
 from unilabos.client.host.runtime.action import ActionContext
 from unilabos.registry.decorators import topic_config
-from unilabos.registry.placeholder_type import ResourceSlot
+from unilabos.registry.placeholder_type import DeviceSlot, ResourceSlot
 from unilabos.resources.resource_tracker import DeviceNodeResourceTracker
 
 
@@ -602,6 +602,117 @@ def test_hostlink_runtime_resolves_resource_slot_before_driver_call() -> None:
         ) == "plate"
     finally:
         runtime.stop()
+
+
+class TransferDriver:
+    def __init__(self, device_id=None, config=None):
+        self.device_id = device_id
+
+    def pick_material(self, material: ResourceSlot, target_owner: ResourceSlot) -> dict:
+        return {"material": material.name, "target_owner": target_owner}
+
+    def pick_into_gripper(self, material: ResourceSlot, target_owner: DeviceSlot) -> dict:
+        return {"material": material.name, "target_owner": target_owner}
+
+
+class _AuthorityTrees:
+    """物料权威的最小替身：按 uuid 返回整棵子树（with_children）。"""
+
+    def __init__(self, tree_set) -> None:
+        self.trees = {node.res_content.uuid: node for node in tree_set.all_nodes}
+
+    def get_resources_sync(self, uuids, with_children=True):
+        from unilabos.resources.resource_tracker import ResourceTreeInstance, ResourceTreeSet
+
+        return ResourceTreeSet([ResourceTreeInstance(self.trees[uuid]) for uuid in uuids if uuid in self.trees])
+
+    def get_resource_by_id_sync(self, resource_id, with_children=True):
+        raise KeyError(resource_id)
+
+
+ROBOT_UUID = "6f0d1f3e-0c7a-4a55-9b7e-1d2c3b4a5f60"
+WORKDECK_DEVICE_UUID = "0b9e8d7c-6a5f-4e3d-8c2b-1a0f9e8d7c6b"
+
+
+def _transfer_runtime():
+    from unilabos.resources.resource_tracker import ResourceTreeSet
+    from unilabos.server.services.materials.graph import graph_resource_tree
+    from tests.plr_fixtures import plate
+
+    def device(device_id: str, uuid: str) -> dict:
+        return {"id": device_id, "uuid": uuid, "type": "device", "class": "test_device",
+                "template_name": "test_device", "parent": None, "config": {}}
+
+    deck_nodes = ResourceTreeSet.from_plr_resources([plate("deck_plate")], known_random_uuid=True).dump()[0]
+    deck_nodes[0]["parent_uuid"] = WORKDECK_DEVICE_UUID
+    graph = graph_resource_tree([device("robot", ROBOT_UUID), device("workdeck", WORKDECK_DEVICE_UUID), *deck_nodes])
+
+    runtime = HostLinkLocalRuntime()
+    runtime.add_driver(
+        HostLinkDriverSpec("robot", TransferDriver, {}, action_names=("pick_material", "pick_into_gripper"))
+    )
+    runtime.start()
+    node = runtime.devices["robot"]
+    node.__dict__["_device_resource_service"] = _AuthorityTrees(graph)
+    from pylabrobot.resources import Resource
+
+    held = Resource("held_plate", size_x=1, size_y=1, size_z=1)
+    held.unilabos_uuid = "held-plate-uuid"
+    node.resource_tracker.add_resource(held)
+    return runtime, graph
+
+
+@pytest.mark.parametrize("owner_uuid, owner_id", [(ROBOT_UUID, "robot"), (WORKDECK_DEVICE_UUID, "workdeck")])
+def test_resource_slot_pointing_at_a_device_is_rejected_before_the_driver(owner_uuid, owner_id) -> None:
+    """ResourceSlot 只指物料：传进来的是设备（机械臂本身；台面设备下挂着 PLR 物料也一样）时明确报错。
+
+    以前权威取回设备树后 ``to_plr_resources()[0]`` 越界，报 "list index out of range"；现在指出参数与设备，
+    并说明设备参数用 DeviceSlot。
+    """
+
+    runtime, _graph = _transfer_runtime()
+    try:
+        with pytest.raises(ValueError) as caught:
+            runtime.call_action(
+                "robot", "pick_material", material={"uuid": "held-plate-uuid"}, target_owner={"uuid": owner_uuid}
+            )
+    finally:
+        runtime.stop()
+
+    message = str(caught.value)
+    assert "target_owner" in message and owner_id in message and owner_uuid in message
+    assert "DeviceSlot" in message and "设备不是物料" in message
+
+
+def test_resource_slot_tree_rooted_at_a_device_is_rejected() -> None:
+    """上游端口传来的扁平树以设备为根时同样报错，不转 PLR。"""
+
+    runtime, graph = _transfer_runtime()
+    robot_tree = next(tree for tree in graph.dump() if tree[0]["uuid"] == ROBOT_UUID)
+    try:
+        with pytest.raises(ValueError, match="DeviceSlot"):
+            runtime.call_action("robot", "pick_material", material={"uuid": "held-plate-uuid"}, target_owner=robot_tree)
+    finally:
+        runtime.stop()
+
+
+def test_device_slot_reaches_the_driver_as_the_device_id() -> None:
+    """DeviceSlot 原样交给驱动（设备 id 字符串），不做物料转换、不回权威查询。"""
+
+    runtime, _graph = _transfer_runtime()
+    node = runtime.devices["robot"]
+    authority = node.__dict__["_device_resource_service"]
+    queried: list = []
+    authority.get_resources_sync = lambda uuids, with_children=True: queried.append(uuids)
+    try:
+        result = runtime.call_action(
+            "robot", "pick_into_gripper", material={"uuid": "held-plate-uuid"}, target_owner="robot"
+        )
+    finally:
+        runtime.stop()
+
+    assert result == {"material": "held_plate", "target_owner": "robot"}
+    assert type(result["target_owner"]) is str and queried == []
 
 
 def test_hostlink_runtime_honors_topic_config_period_and_name() -> None:
